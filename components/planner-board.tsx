@@ -27,6 +27,10 @@ import { AddTaskDialog } from "./add-task-dialog"
 import { toast } from "sonner"
 import { v4 as uuidv4 } from 'uuid'
 import { cn } from "@/lib/utils"
+import { db, auth } from "@/lib/firebase"
+import { doc, setDoc, onSnapshot, getDoc } from "firebase/firestore"
+import { onAuthStateChanged, User } from "firebase/auth"
+import { AuthButton } from "./auth-button"
 
 // Mock data for initial state or fallback
 const MOCK_TASKS: Task[] = [
@@ -78,57 +82,99 @@ export function PlannerBoard() {
   const [selectedSectionFilter, setSelectedSectionFilter] = useState<string>("all")
   const [poolSortMode, setPoolSortMode] = useState<"default" | "class">("default")
 
+  const [user, setUser] = useState<User | null>(null)
+  const [isAuthLoading, setIsAuthLoading] = useState(true)
+
+  // Auth State Listener
   useEffect(() => {
-    const storedToken = localStorage.getItem("todoist_api_token")
-    const storedNotes = localStorage.getItem("daily_notes")
-    const storedPool = localStorage.getItem("pool_tasks")
-    const storedSchedule = localStorage.getItem("schedule_tasks")
-    const storedLater = localStorage.getItem("later_tasks")
-    const storedColors = localStorage.getItem("section_colors")
-
-    if (storedColors) {
-      setSectionColors(JSON.parse(storedColors))
-    }
-
-    let currentPool: Task[] = []
-    let currentSchedule: Task[] = []
-    let currentLater: Task[] = []
-
-    if (storedPool) {
-      currentPool = JSON.parse(storedPool)
-      setPoolTasks(currentPool)
-    }
-    if (storedSchedule) {
-      currentSchedule = JSON.parse(storedSchedule)
-      setScheduleTasks(currentSchedule)
-    }
-    if (storedLater) {
-      currentLater = JSON.parse(storedLater)
-      setLaterTasks(currentLater)
-    }
-
-    if (storedNotes) {
-      setNotes(storedNotes)
-    }
-
-    if (storedToken) {
-      setApiToken(storedToken)
-      // Pass the loaded tasks to sync so we don't duplicate or overwrite
-      handleFetchTasks(storedToken, currentPool, currentSchedule, currentLater)
-    }
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser)
+      setIsAuthLoading(false)
+    })
+    return () => unsubscribe()
   }, [])
 
+  // Firestore Sync Listener
   useEffect(() => {
-    localStorage.setItem("daily_notes", notes)
-  }, [notes])
+    if (!user) {
+      // If not logged in, load from localStorage as fallback
+      const storedToken = localStorage.getItem("todoist_api_token")
+      const storedNotes = localStorage.getItem("daily_notes")
+      const storedPool = localStorage.getItem("pool_tasks")
+      const storedSchedule = localStorage.getItem("schedule_tasks")
+      const storedLater = localStorage.getItem("later_tasks")
+      const storedColors = localStorage.getItem("section_colors")
 
+      if (storedColors) setSectionColors(JSON.parse(storedColors))
+      if (storedPool) setPoolTasks(JSON.parse(storedPool))
+      if (storedSchedule) setScheduleTasks(JSON.parse(storedSchedule))
+      if (storedLater) setLaterTasks(JSON.parse(storedLater))
+      if (storedNotes) setNotes(storedNotes)
+      if (storedToken) {
+        setApiToken(storedToken)
+        // We don't auto-fetch here to avoid double fetching if logic is complex, 
+        // but we can if we want. For now let's just load state.
+      }
+      return
+    }
+
+    const userDocRef = doc(db, "users", user.uid)
+
+    const unsubscribe = onSnapshot(userDocRef, (docSnapshot) => {
+      if (docSnapshot.exists()) {
+        const data = docSnapshot.data()
+        setPoolTasks(data.poolTasks || [])
+        setScheduleTasks(data.scheduleTasks || [])
+        setLaterTasks(data.laterTasks || [])
+        setNotes(data.notes || "")
+        setSectionColors(data.sectionColors || {})
+        if (data.todoistApiToken) setApiToken(data.todoistApiToken)
+      } else {
+        // New user, maybe initialize with defaults?
+        // For now, just don't overwrite local state if it's already set (e.g. from MOCK)
+      }
+    }, (error) => {
+      console.error("Firestore sync error:", error)
+      toast.error("Failed to sync data")
+    })
+
+    return () => unsubscribe()
+  }, [user])
+
+  // Save to Firestore (Debounced) OR LocalStorage
   useEffect(() => {
-    localStorage.setItem("pool_tasks", JSON.stringify(poolTasks))
-    localStorage.setItem("schedule_tasks", JSON.stringify(scheduleTasks))
-    localStorage.setItem("later_tasks", JSON.stringify(laterTasks))
-    localStorage.setItem("section_colors", JSON.stringify(sectionColors))
-  }, [poolTasks, scheduleTasks, laterTasks, sectionColors])
+    if (isAuthLoading) return
 
+    if (!user) {
+      // Save to localStorage if not logged in
+      localStorage.setItem("daily_notes", notes)
+      localStorage.setItem("pool_tasks", JSON.stringify(poolTasks))
+      localStorage.setItem("schedule_tasks", JSON.stringify(scheduleTasks))
+      localStorage.setItem("later_tasks", JSON.stringify(laterTasks))
+      localStorage.setItem("section_colors", JSON.stringify(sectionColors))
+      return
+    }
+
+    const saveData = async () => {
+      try {
+        await setDoc(doc(db, "users", user.uid), {
+          poolTasks,
+          scheduleTasks,
+          laterTasks,
+          notes,
+          sectionColors,
+          todoistApiToken: apiToken
+        }, { merge: true })
+      } catch (error) {
+        console.error("Error saving to Firestore:", error)
+      }
+    }
+
+    const timeoutId = setTimeout(saveData, 1000) // Debounce 1s
+    return () => clearTimeout(timeoutId)
+  }, [poolTasks, scheduleTasks, laterTasks, notes, sectionColors, apiToken, user, isAuthLoading])
+
+  // Timer logic
   useEffect(() => {
     const interval = setInterval(() => {
       setScheduleTasks(prev => prev.map(t => {
@@ -166,13 +212,9 @@ export function PlannerBoard() {
       if (error) {
         toast.error(error)
       } else {
-        // Use provided current tasks or fallback to state (though state might be stale in useEffect)
-        // Better to rely on passed arguments if available
         const scheduleIds = new Set(currentSchedule.map((t) => t.id))
         const laterIds = new Set(currentLater.map((t) => t.id))
-        // const poolIds = new Set(currentPool.map((t) => t.id)) // This line is not needed with the new logic
 
-        // Create a map of all existing tasks to preserve their local data (like duration)
         const allExistingTasks = new Map([
           ...currentPool,
           ...currentSchedule,
@@ -182,33 +224,17 @@ export function PlannerBoard() {
         const availableTasks = tasks.filter((t) => !scheduleIds.has(t.id) && !laterIds.has(t.id))
 
         setPoolTasks(prevPool => {
-          // We need to merge new tasks with existing pool tasks
-          // If a task is in availableTasks, it means it's NOT in schedule or later.
-          // So we should add it to pool if it's not there, or update it if it is.
-
           return availableTasks.map(t => {
             const existing = allExistingTasks.get(t.id)
-
-            // Duration logic:
-            // 1. If Todoist has a duration (t.duration), use it (assuming it's the source of truth or updated).
-            // 2. If Todoist content has a parsed duration, use it IF it's different from existing?
-            //    Actually, user said: "unless a new time has been added inside the name".
-            //    This implies if the name changed to include a time, we update.
-            //    If we have an existing duration, and the new task has NO duration in name/api, keep existing.
-
             let finalDuration = t.duration
 
             if (!finalDuration && existing?.duration) {
-              // If new task has no duration, but we have one locally, keep it.
-              // UNLESS the content changed and explicitly removed it? Hard to know.
-              // But user wants to preserve local time.
               finalDuration = existing.duration
             }
 
             return {
               ...t,
               duration: finalDuration,
-              // Preserve other local state if needed, e.g. timer
               timer: existing?.timer
             }
           })
@@ -225,7 +251,9 @@ export function PlannerBoard() {
 
   const handleSaveToken = (token: string) => {
     setApiToken(token)
-    localStorage.setItem("todoist_api_token", token)
+    if (!user) {
+      localStorage.setItem("todoist_api_token", token)
+    }
     handleFetchTasks(token, poolTasks, scheduleTasks, laterTasks)
   }
 
@@ -283,7 +311,6 @@ export function PlannerBoard() {
   const handleAddTask = async (task: { content: string; dueString: string; priority: number; sectionId?: string; duration?: number }) => {
     if (!apiToken) return
 
-    // Append duration to content if present
     let finalContent = task.content
     if (task.duration) {
       const hours = Math.floor(task.duration / 60)
@@ -320,7 +347,6 @@ export function PlannerBoard() {
           }
         }
       }
-      // Pause all other tasks
       if (t.timer?.isPlaying) {
         return {
           ...t,
@@ -500,13 +526,11 @@ export function PlannerBoard() {
 
       const sorted = [...poolTasks].sort((a, b) => {
         if (poolSortMode === "class") {
-          // Sort by class FIRST - this ensures all sections are grouped together
           const sectionA = a.sectionName || ""
           const sectionB = b.sectionName || ""
           const sectionCompare = sectionA.localeCompare(sectionB)
           if (sectionCompare !== 0) return sectionCompare
 
-          // Within same section: Due Date → Duration → Priority
           if (a.due?.date && !b.due?.date) return -1
           if (!a.due?.date && b.due?.date) return 1
           if (a.due?.date && b.due?.date) {
@@ -521,7 +545,6 @@ export function PlannerBoard() {
           return b.priority - a.priority
         }
 
-        // Default mode: Due Date → Duration → Priority (no section grouping)
         if (a.due?.date && !b.due?.date) return -1
         if (!a.due?.date && b.due?.date) return 1
         if (a.due?.date && b.due?.date) {
@@ -570,6 +593,7 @@ export function PlannerBoard() {
           <h1 className="text-lg font-semibold">Focus Planner</h1>
         </div>
         <div className="flex items-center gap-2">
+          <AuthButton />
           <Button
             variant="outline"
             size="sm"
@@ -671,7 +695,6 @@ export function PlannerBoard() {
                     <Button variant="outline" onClick={() => {
                       const newMode = poolSortMode === "default" ? "class" : "default";
                       setPoolSortMode(newMode);
-                      // Reset sorting state to allow re-sort
                       setIsPoolSorted(false);
                       handleTogglePoolSort();
                     }}>
