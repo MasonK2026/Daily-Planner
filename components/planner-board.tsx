@@ -84,6 +84,7 @@ export function PlannerBoard() {
 
   const [user, setUser] = useState<User | null>(null)
   const [isAuthLoading, setIsAuthLoading] = useState(true)
+  const [isDataLoaded, setIsDataLoaded] = useState(false)
 
   // Auth State Listener
   useEffect(() => {
@@ -112,9 +113,8 @@ export function PlannerBoard() {
       if (storedNotes) setNotes(storedNotes)
       if (storedToken) {
         setApiToken(storedToken)
-        // We don't auto-fetch here to avoid double fetching if logic is complex, 
-        // but we can if we want. For now let's just load state.
       }
+      setIsDataLoaded(true) // Local data loaded
       return
     }
 
@@ -133,9 +133,11 @@ export function PlannerBoard() {
         // New user, maybe initialize with defaults?
         // For now, just don't overwrite local state if it's already set (e.g. from MOCK)
       }
+      setIsDataLoaded(true) // Cloud data loaded (or confirmed empty)
     }, (error) => {
       console.error("Firestore sync error:", error)
       toast.error("Failed to sync data")
+      setIsDataLoaded(true) // Even on error, we allow saving to retry? Or maybe not. Let's allow it to avoid locking app.
     })
 
     return () => unsubscribe()
@@ -143,7 +145,7 @@ export function PlannerBoard() {
 
   // Save to Firestore (Debounced) OR LocalStorage
   useEffect(() => {
-    if (isAuthLoading) return
+    if (isAuthLoading || !isDataLoaded) return
 
     if (!user) {
       // Save to localStorage if not logged in
@@ -172,7 +174,7 @@ export function PlannerBoard() {
 
     const timeoutId = setTimeout(saveData, 1000) // Debounce 1s
     return () => clearTimeout(timeoutId)
-  }, [poolTasks, scheduleTasks, laterTasks, notes, sectionColors, apiToken, user, isAuthLoading])
+  }, [poolTasks, scheduleTasks, laterTasks, notes, sectionColors, apiToken, user, isAuthLoading, isDataLoaded])
 
   // Timer logic
   useEffect(() => {
